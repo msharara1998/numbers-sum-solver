@@ -79,7 +79,11 @@ def solve_by_elimination_and_selection(grid: PuzzleGrid) -> PuzzleGrid:
         # Constraint is satisfied if:
         # 1. We have the exact sum and no undecided cells, OR
         # 2. All cells are decided (True or False)
-        if selected_sum == constraint.sum and not unselected_cells:
+        if selected_sum == constraint.sum:
+            if not unselected_cells:
+                # select all unselected cells as False
+                for cell in unselected_cells:
+                    cell.isSelected = False
             constraint.is_satisfied = True
 
     return grid
