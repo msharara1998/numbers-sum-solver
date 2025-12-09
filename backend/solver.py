@@ -31,8 +31,13 @@ def solve_by_elimination_and_selection(grid: PuzzleGrid) -> PuzzleGrid:
         # Get cells of the constraint
         cells = get_cells_of(constraint, grid)
 
-        known_sum = sum(cell.value for cell in cells if cell.isSelected is True)
-        remaining_cells = [cell for cell in cells if cell.isSelected is None]
+        known_sum = 0
+        remaining_cells = []
+        for cell in cells:
+            if cell.isSelected is True:
+                known_sum += cell.value
+            elif cell.isSelected is None:
+                remaining_cells.append(cell)
         remaining_sum = constraint.sum - known_sum
 
         # If remaining sum is less than or equal to 0, mark constraint as
