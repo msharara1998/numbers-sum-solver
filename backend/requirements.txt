@@ -1,5 +1,7 @@
 fastapi
-uvicorn
+uvicorn[standard]
 gunicorn
+pydantic
 rapidocr
 onnxruntime
+python-multipart

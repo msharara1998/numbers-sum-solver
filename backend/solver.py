@@ -113,7 +113,7 @@ def main_solver(grid: PuzzleGrid, max_iterations: int = 100) -> PuzzleGrid:
             break
 
         # Apply solving strategy
-        grid_before = grid.copy()
+        grid_before = grid.model_copy(deep=True)
         grid = solve_by_elimination_and_selection(grid)
 
         # Check if we made any progress

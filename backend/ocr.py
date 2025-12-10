@@ -8,8 +8,8 @@ from typing import List, Tuple, Optional
 from pathlib import Path
 import re
 
-from rapidocr_onnxruntime import RapidOCR
-
+from rapidocr import RapidOCR
+from rapidocr.utils.output import RapidOCROutput
 from .models import PuzzleGrid, GridCell, Constraint
 
 
@@ -33,20 +33,26 @@ class PuzzleOCRExtractor:
             ValueError: If the image cannot be processed or grid cannot be extracted.
         """
         # Run OCR on the image
-        result, elapse = self.engine(image_path)
+        ocr_result = self.engine(image_path)
 
-        if not result:
+        if not isinstance(ocr_result, RapidOCROutput):
+            raise ValueError("Unexpected OCR output format")
+
+        if not ocr_result or len(ocr_result) == 0:
             raise ValueError("No text detected in image")
 
-        # Extract text and bounding boxes
+        # Extract text and bounding boxes from RapidOCROutput
         texts_with_boxes = []
-        for item in result:
-            box, text, confidence = item
-            texts_with_boxes.append({
-                "text": text,
-                "box": box,
-                "confidence": confidence,
-            })
+        if ocr_result.boxes is not None and ocr_result.txts is not None and ocr_result.scores is not None:
+            for box, text, confidence in zip(ocr_result.boxes, ocr_result.txts, ocr_result.scores):
+                texts_with_boxes.append({
+                    "text": text,
+                    "box": box,
+                    "confidence": confidence,
+                })
+
+        if not texts_with_boxes:
+            raise ValueError("No text detected in image")
 
         # Parse the detected text into grid structure
         grid = self._parse_grid_from_ocr(texts_with_boxes)
@@ -66,20 +72,26 @@ class PuzzleOCRExtractor:
             ValueError: If the image cannot be processed or grid cannot be extracted.
         """
         # Run OCR on the image bytes
-        result, elapse = self.engine(image_bytes)
+        ocr_result = self.engine(image_bytes)
 
-        if not result:
+        if not isinstance(ocr_result, RapidOCROutput):
+            raise ValueError("Unexpected OCR output format")
+
+        if not ocr_result or len(ocr_result) == 0:
             raise ValueError("No text detected in image")
 
-        # Extract text and bounding boxes
+        # Extract text and bounding boxes from RapidOCROutput
         texts_with_boxes = []
-        for item in result:
-            box, text, confidence = item
-            texts_with_boxes.append({
-                "text": text,
-                "box": box,
-                "confidence": confidence,
-            })
+        if ocr_result.boxes is not None and ocr_result.txts is not None and ocr_result.scores is not None:
+            for box, text, confidence in zip(ocr_result.boxes, ocr_result.txts, ocr_result.scores):
+                texts_with_boxes.append({
+                    "text": text,
+                    "box": box,
+                    "confidence": confidence,
+                })
+
+        if not texts_with_boxes:
+            raise ValueError("No text detected in image")
 
         # Parse the detected text into grid structure
         grid = self._parse_grid_from_ocr(texts_with_boxes)
@@ -91,9 +103,6 @@ class PuzzleOCRExtractor:
     ) -> PuzzleGrid:
         """Parse OCR results into a puzzle grid.
 
-        This is a placeholder implementation that needs to be customized
-        based on the actual puzzle image format.
-
         Args:
             texts_with_boxes: List of detected text with bounding boxes.
 
@@ -103,133 +112,230 @@ class PuzzleOCRExtractor:
         Raises:
             ValueError: If grid structure cannot be determined.
         """
-        # Extract numbers from detected text
+        # Extract numbers from detected text with bounding box info
         numbers = []
         for item in texts_with_boxes:
             text = item["text"].strip()
             # Try to extract number
             if text.isdigit():
+                # Get bounding box dimensions
+                box = item["box"]
+                top_left_x = float(box[0][0]) if hasattr(box[0], '__getitem__') else float(box[0])
+                top_left_y = float(box[0][1]) if hasattr(box[0], '__getitem__') else float(box[1])
+                bottom_right_x = float(box[2][0]) if hasattr(box[2], '__getitem__') else float(box[4])
+                bottom_right_y = float(box[2][1]) if hasattr(box[2], '__getitem__') else float(box[5])
+                
+                # Calculate bounding box area
+                width = abs(bottom_right_x - top_left_x)
+                height = abs(bottom_right_y - top_left_y)
+                area = width * height
+                
                 numbers.append({
                     "value": int(text),
                     "box": item["box"],
                     "confidence": item["confidence"],
+                    "top_left_x": top_left_x,
+                    "top_left_y": top_left_y,
+                    "width": width,
+                    "height": height,
+                    "area": area,
                 })
 
         if not numbers:
             raise ValueError("No numbers detected in image")
 
+        # Filter out small corner annotations by comparing bbox areas
+        numbers = self._filter_small_annotations(numbers)
+
+        if not numbers:
+            raise ValueError("No valid numbers detected after filtering")
+
         # Sort numbers by position (top to bottom, left to right)
-        numbers.sort(key=lambda x: (x["box"][0][1], x["box"][0][0]))
+        numbers.sort(key=lambda x: (x["top_left_y"], x["top_left_x"]))
 
-        # Determine grid dimensions
-        # This is a simplified approach - in practice, you'd need more
-        # sophisticated logic to determine the grid structure
-        grid_size = self._estimate_grid_size(numbers)
+        # Separate constraints from grid cells
+        # First row = column constraints, first column = row constraints
+        grid_with_constraints = self._separate_constraints_and_grid(numbers)
 
-        # Create cells
-        cells = self._create_cells_from_numbers(numbers, grid_size)
+        return grid_with_constraints
 
-        # Create constraints (placeholder - needs actual constraint detection)
-        constraints = self._create_default_constraints(grid_size)
-
-        return PuzzleGrid(cells=cells, constraints=constraints)
-
-    def _estimate_grid_size(self, numbers: List[dict]) -> int:
-        """Estimate the grid size from detected numbers.
+    def _filter_small_annotations(self, numbers: List[dict]) -> List[dict]:
+        """Filter out small corner annotations by comparing bounding box areas.
 
         Args:
-            numbers: List of detected numbers with positions.
+            numbers: List of detected numbers with bbox information.
 
         Returns:
-            int: Estimated grid size (assumes square grid).
+            List of numbers with small annotations removed.
         """
-        # Simple estimation: square root of number count
-        import math
+        if len(numbers) < 3:
+            return numbers
 
-        count = len(numbers)
-        size = int(math.sqrt(count))
+        # Calculate median area
+        areas = [n["area"] for n in numbers]
+        areas_sorted = sorted(areas)
+        median_area = areas_sorted[len(areas_sorted) // 2]
 
-        # Adjust if not perfect square
-        if size * size < count:
-            size += 1
+        # Filter out numbers with area less than 30% of median
+        # These are likely small corner annotations
+        threshold = median_area * 0.3
+        filtered = [n for n in numbers if n["area"] >= threshold]
 
-        return size
+        return filtered if filtered else numbers
 
-    def _create_cells_from_numbers(
-        self, numbers: List[dict], grid_size: int
-    ) -> List[List[GridCell]]:
-        """Create grid cells from detected numbers.
+    def _separate_constraints_and_grid(self, numbers: List[dict]) -> PuzzleGrid:
+        """Separate constraint sums from grid cells.
+
+        Assumes first row contains column constraints and first column contains row constraints.
 
         Args:
-            numbers: List of detected numbers.
-            grid_size: Size of the grid.
+            numbers: Sorted list of detected numbers.
 
         Returns:
-            List[List[GridCell]]: 2D array of grid cells.
+            PuzzleGrid with properly separated constraints and cells.
+
+        Raises:
+            ValueError: If grid structure cannot be determined.
         """
+        # Group numbers by rows using y-coordinate clustering
+        rows = self._cluster_into_rows(numbers)
+
+        if len(rows) < 2:
+            raise ValueError("Not enough rows detected for valid grid")
+
+        # Sort each row by x-coordinate
+        grid_2d = []
+        for row_numbers in rows:
+            row_numbers_sorted = sorted(row_numbers, key=lambda x: x["top_left_x"])
+            grid_2d.append(row_numbers_sorted)
+        
+        # Find the column with most numbers (this should be the actual grid width)
+        max_cols = max(len(row) for row in grid_2d)
+        
+        # The first row should contain column constraints
+        # If first row has fewer elements than max, we need to identify which row is actually the constraint row
+        # by finding the row with largest average height (constraint numbers are typically larger)
+        if len(grid_2d[0]) < max_cols:
+            # Find row with largest average height
+            row_heights = []
+            for row_idx, row in enumerate(grid_2d):
+                if len(row) > 0:
+                    avg_height = sum(n["height"] for n in row) / len(row)
+                    row_heights.append((row_idx, avg_height, len(row)))
+            
+            # Sort by height (descending) to find constraint row
+            row_heights.sort(key=lambda x: x[1], reverse=True)
+            
+            # The row with largest average height and at least max_cols-1 elements is likely the constraint row
+            constraint_row_idx = 0
+            for idx, height, length in row_heights:
+                if length >= max_cols - 1:  # Allow for 1 missing element
+                    constraint_row_idx = idx
+                    break
+            
+            # If constraint row is not first, swap it to first position
+            if constraint_row_idx != 0:
+                grid_2d[0], grid_2d[constraint_row_idx] = grid_2d[constraint_row_idx], grid_2d[0]
+
+        # Determine the expected number of columns (should be number of elements in first row)
+        # This represents the column constraint count
+        expected_cols = len(grid_2d[0])
+        
+        # Pad all other rows to match the expected column count
+        for i in range(1, len(grid_2d)):
+            if len(grid_2d[i]) < expected_cols:
+                # Pad with None placeholders
+                grid_2d[i] = grid_2d[i] + [None] * (expected_cols - len(grid_2d[i]))
+            elif len(grid_2d[i]) > expected_cols:
+                # Trim to expected size
+                grid_2d[i] = grid_2d[i][:expected_cols]
+
+        # Extract constraints: first row = column sums, first column = row sums
+        col_constraints = []
+        row_constraints = []
+
+        # First row = column constraints (all numbers in first row)
+        for col_idx, num_item in enumerate(grid_2d[0]):
+            if num_item is not None:
+                col_constraints.append(Constraint(
+                    type="column",
+                    index=col_idx,
+                    sum=num_item["value"],
+                    is_satisfied=False,
+                ))
+
+        # First column = row constraints (skip first row since it's already used for column constraints)
+        for row_idx in range(1, len(grid_2d)):
+            num_item = grid_2d[row_idx][0]
+            if num_item is not None:
+                row_constraints.append(Constraint(
+                    type="row",
+                    index=row_idx - 1,
+                    sum=num_item["value"],
+                    is_satisfied=False,
+                ))
+
+        # Extract grid cells (skip first row and first column)
         cells = []
-        idx = 0
-
-        for row in range(grid_size):
+        for row_idx in range(1, len(grid_2d)):
             row_cells = []
-            for col in range(grid_size):
-                if idx < len(numbers):
-                    value = numbers[idx]["value"]
-                    idx += 1
-                else:
-                    value = None
-
+            for col_idx in range(1, len(grid_2d[row_idx])):
+                num_item = grid_2d[row_idx][col_idx]
                 cell = GridCell(
-                    row=row,
-                    col=col,
-                    value=value,
+                    row=row_idx - 1,
+                    col=col_idx - 1,
+                    value=num_item["value"] if num_item is not None else None,
                     isSelected=None,
                 )
                 row_cells.append(cell)
-
             cells.append(row_cells)
 
-        return cells
+        constraints = row_constraints + col_constraints
 
-    def _create_default_constraints(
-        self, grid_size: int
-    ) -> List[Constraint]:
-        """Create default constraints for the grid.
+        return PuzzleGrid(cells=cells, constraints=constraints)
 
-        This is a placeholder that creates constraints with sum=0.
-        In practice, you'd need to detect actual constraint values from the image.
+    def _cluster_into_rows(self, numbers: List[dict]) -> List[List[dict]]:
+        """Cluster numbers into rows based on y-coordinates.
 
         Args:
-            grid_size: Size of the grid.
+            numbers: List of numbers with position information.
 
         Returns:
-            List[Constraint]: List of constraints.
+            List of rows, where each row is a list of numbers.
         """
-        constraints = []
+        if not numbers:
+            return []
 
-        # Add row constraints
-        for i in range(grid_size):
-            constraints.append(
-                Constraint(
-                    type="row",
-                    index=i,
-                    sum=0,  # Placeholder - needs actual detection
-                    is_satisfied=False,
-                )
-            )
+        # Sort by y-coordinate
+        sorted_numbers = sorted(numbers, key=lambda x: x["top_left_y"])
 
-        # Add column constraints
-        for i in range(grid_size):
-            constraints.append(
-                Constraint(
-                    type="column",
-                    index=i,
-                    sum=0,  # Placeholder - needs actual detection
-                    is_satisfied=False,
-                )
-            )
+        # Use median height as threshold for row separation
+        heights = [n["height"] for n in sorted_numbers]
+        median_height = sorted(heights)[len(heights) // 2]
+        row_threshold = median_height * 0.6  # Increased threshold for more robust clustering
 
-        return constraints
+        rows = []
+        current_row = [sorted_numbers[0]]
+
+        for num in sorted_numbers[1:]:
+            # Calculate average y-coordinate of current row for more accurate clustering
+            current_avg_y = sum(n["top_left_y"] for n in current_row) / len(current_row)
+            
+            # If y-coordinate is close to current row average, add to current row
+            if abs(num["top_left_y"] - current_avg_y) < row_threshold:
+                current_row.append(num)
+            else:
+                # Start new row
+                rows.append(current_row)
+                current_row = [num]
+
+        # Add last row
+        if current_row:
+            rows.append(current_row)
+
+        return rows
+
+
 
 
 def extract_puzzle_from_image(image_path: str) -> PuzzleGrid:

@@ -1,2 +1,0 @@
-- Every python function must be type hinted and docstringed using Google format
-- Do not make any markdown file unless explicitly asked to

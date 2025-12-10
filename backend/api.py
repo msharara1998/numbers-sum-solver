@@ -1,11 +1,13 @@
 from fastapi import APIRouter, FastAPI, UploadFile, File, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from typing import AsyncGenerator, Dict
 import uuid
 import asyncio
+import logging
+from asyncio import Lock
 from datetime import datetime
 
-# Import Pydantic models
 from .models import (
     ProcessImageResponse,
     SolveResponse,
@@ -13,16 +15,22 @@ from .models import (
     PuzzleGrid,
     GridCell,
 )
-
-# Import solver functions
-from .solver import main_solver
 from .utils import is_grid_solved
+from .ocr import extract_puzzle_from_bytes
+from .config import (
+    MAX_SOLVER_ITERATIONS,
+    SOLVER_ITERATION_DELAY,
+    SSE_POLL_INTERVAL,
+    SESSION_TIMEOUT,
+    SESSION_CLEANUP_INTERVAL,
+)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# In-memory storage for solving sessions
-# In production, use Redis or similar
 solving_sessions: Dict[str, Dict] = {}
+session_lock = Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -58,22 +66,22 @@ async def process_image(image: UploadFile = File(...)) -> ProcessImageResponse:
         )
 
     try:
-        # Read image bytes
+        logger.info(f"Processing uploaded image: {image.filename}")
         image_bytes = await image.read()
 
-        # Extract grid using OCR
-        from .ocr import extract_puzzle_from_bytes
-
         grid = extract_puzzle_from_bytes(image_bytes)
+        logger.info(f"Successfully extracted grid with {len(grid.cells)} rows")
 
         return ProcessImageResponse(grid=grid)
 
     except ValueError as e:
+        logger.error(f"Failed to extract puzzle from image: {e}")
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Could not extract puzzle from image: {str(e)}",
         )
     except Exception as e:
+        logger.error(f"Error processing image: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error processing image: {str(e)}",
@@ -106,26 +114,64 @@ async def solve_puzzle(grid: PuzzleGrid) -> SolveResponse:
     Raises:
         HTTPException: If the grid is invalid or has contradictory constraints.
     """
-    # Validate grid has cells and constraints
     if not grid.cells or not grid.constraints:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Grid must have cells and constraints",
         )
 
-    # Create solving session
-    solving_id = str(uuid.uuid4())
-    solving_sessions[solving_id] = {
-        "grid": grid,
-        "status": "pending",
-        "created_at": datetime.now(),
-        "progress": [],
-    }
+    if any(len(row) == 0 for row in grid.cells):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Grid must not contain empty rows",
+        )
 
-    # Start solving in background
-    asyncio.create_task(solve_in_background(solving_id, grid))
+    num_rows = len(grid.cells)
+    num_cols = len(grid.cells[0]) if grid.cells else 0
+
+    for constraint in grid.constraints:
+        if constraint.type == "row" and constraint.index >= num_rows:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Row constraint index {constraint.index} out of bounds (grid has {num_rows} rows)",
+            )
+        if constraint.type == "column" and constraint.index >= num_cols:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Column constraint index {constraint.index} out of bounds (grid has {num_cols} columns)",
+            )
+
+    logger.info(f"Starting solve for grid with {num_rows}x{num_cols} cells")
+
+    solving_id = str(uuid.uuid4())
+    
+    async with session_lock:
+        solving_sessions[solving_id] = {
+            "grid": grid,
+            "status": "pending",
+            "created_at": datetime.now(),
+            "progress": [],
+        }
+
+    task = asyncio.create_task(solve_in_background(solving_id, grid))
+    task.add_done_callback(lambda t: _handle_task_exception(t, solving_id))
+    
+    logger.info(f"Created solving session {solving_id}")
 
     return SolveResponse(solvingId=solving_id)
+
+
+def _handle_task_exception(task: asyncio.Task, solving_id: str) -> None:
+    """Handle exceptions from background solving tasks.
+
+    Args:
+        task: The completed asyncio Task.
+        solving_id: The solving session ID.
+    """
+    try:
+        task.result()
+    except Exception as e:
+        logger.error(f"Background task for session {solving_id} failed: {e}", exc_info=True)
 
 
 async def solve_in_background(solving_id: str, grid: PuzzleGrid) -> None:
@@ -136,17 +182,18 @@ async def solve_in_background(solving_id: str, grid: PuzzleGrid) -> None:
         grid: The puzzle grid to solve.
     """
     try:
-        solving_sessions[solving_id]["status"] = "solving"
+        logger.info(f"Starting background solving for session {solving_id}")
+        async with session_lock:
+            solving_sessions[solving_id]["status"] = "solving"
 
-        # Solve the puzzle with iteration tracking
         iteration = 0
-        max_iterations = 100
 
-        while iteration < max_iterations:
-            # Check if already solved
+        while iteration < MAX_SOLVER_ITERATIONS:
             if is_grid_solved(grid):
-                solving_sessions[solving_id]["status"] = "complete"
-                solving_sessions[solving_id]["final_grid"] = grid
+                async with session_lock:
+                    solving_sessions[solving_id]["status"] = "complete"
+                    solving_sessions[solving_id]["final_grid"] = grid
+                logger.info(f"Session {solving_id} completed successfully after {iteration} iterations")
                 break
 
             # Save state before solving
@@ -157,33 +204,35 @@ async def solve_in_background(solving_id: str, grid: PuzzleGrid) -> None:
 
             grid = solve_by_elimination_and_selection(grid)
 
-            # Check if we made progress
             from .utils import has_grid_changed
 
             if not has_grid_changed(grid_before, grid):
-                # Stuck - no more progress
-                solving_sessions[solving_id]["status"] = "stuck"
-                solving_sessions[solving_id]["final_grid"] = grid
+                async with session_lock:
+                    solving_sessions[solving_id]["status"] = "stuck"
+                    solving_sessions[solving_id]["final_grid"] = grid
+                logger.warning(f"Session {solving_id} stuck after {iteration} iterations")
                 break
 
-            # Store progress update
-            solving_sessions[solving_id]["progress"].append(
-                {"iteration": iteration, "grid": grid.model_copy(deep=True)}
-            )
+            async with session_lock:
+                solving_sessions[solving_id]["progress"].append(
+                    {"iteration": iteration, "grid": grid.model_copy(deep=True)}
+                )
 
-            # Small delay to make progress visible
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(SOLVER_ITERATION_DELAY)
 
             iteration += 1
 
-        # If we hit max iterations
-        if iteration >= max_iterations:
-            solving_sessions[solving_id]["status"] = "max_iterations"
-            solving_sessions[solving_id]["final_grid"] = grid
+        if iteration >= MAX_SOLVER_ITERATIONS:
+            async with session_lock:
+                solving_sessions[solving_id]["status"] = "max_iterations"
+                solving_sessions[solving_id]["final_grid"] = grid
+            logger.warning(f"Session {solving_id} reached max iterations ({MAX_SOLVER_ITERATIONS})")
 
     except Exception as e:
-        solving_sessions[solving_id]["status"] = "error"
-        solving_sessions[solving_id]["error"] = str(e)
+        logger.error(f"Error in solving session {solving_id}: {e}", exc_info=True)
+        async with session_lock:
+            solving_sessions[solving_id]["status"] = "error"
+            solving_sessions[solving_id]["error"] = str(e)
 
 
 # ---------------------------------------------------------------------------
@@ -210,20 +259,28 @@ async def solve_stream(solving_id: str) -> StreamingResponse:
     Raises:
         HTTPException: If the solving session is not found.
     """
-    if solving_id not in solving_sessions:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Solving session {solving_id} not found",
-        )
+    async with session_lock:
+        if solving_id not in solving_sessions:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Solving session {solving_id} not found",
+            )
+    
+    logger.info(f"Starting SSE stream for session {solving_id}")
 
     async def event_generator() -> AsyncGenerator[bytes, None]:
         """Yield SSE‑formatted events as the solver progresses."""
-        session = solving_sessions[solving_id]
         last_progress_index = 0
 
         while True:
-            # Send any new progress updates
-            progress_list = session.get("progress", [])
+            async with session_lock:
+                session = solving_sessions.get(solving_id)
+                if not session:
+                    logger.warning(f"Session {solving_id} disappeared during streaming")
+                    break
+                
+                progress_list = session.get("progress", [])
+                status_val = session.get("status")
             while last_progress_index < len(progress_list):
                 progress_item = progress_list[last_progress_index]
                 event = ProgressEvent(
@@ -234,21 +291,21 @@ async def solve_stream(solving_id: str) -> StreamingResponse:
                 yield sse_data.encode("utf-8")
                 last_progress_index += 1
 
-            # Check if solving is complete
-            status_val = session.get("status")
-
             if status_val == "complete":
-                final_grid = session.get("final_grid")
+                async with session_lock:
+                    final_grid = session.get("final_grid")
                 event = ProgressEvent(
                     type="complete",
                     cells=final_grid.cells if final_grid else [],
                 )
                 sse_data = f"data: {event.model_dump_json()}\n\n"
                 yield sse_data.encode("utf-8")
+                logger.info(f"Completed SSE stream for session {solving_id}")
                 break
 
             elif status_val in ["stuck", "max_iterations"]:
-                final_grid = session.get("final_grid")
+                async with session_lock:
+                    final_grid = session.get("final_grid")
                 message = (
                     "Solver got stuck - partial solution returned"
                     if status_val == "stuck"
@@ -261,10 +318,12 @@ async def solve_stream(solving_id: str) -> StreamingResponse:
                 )
                 sse_data = f"data: {event.model_dump_json()}\n\n"
                 yield sse_data.encode("utf-8")
+                logger.warning(f"Partial completion for session {solving_id}: {status_val}")
                 break
 
             elif status_val == "error":
-                error_msg = session.get("error", "Unknown error occurred")
+                async with session_lock:
+                    error_msg = session.get("error", "Unknown error occurred")
                 event = ProgressEvent(
                     type="error",
                     cells=[],
@@ -272,79 +331,51 @@ async def solve_stream(solving_id: str) -> StreamingResponse:
                 )
                 sse_data = f"data: {event.model_dump_json()}\n\n"
                 yield sse_data.encode("utf-8")
+                logger.error(f"Error in SSE stream for session {solving_id}: {error_msg}")
                 break
 
-            # Wait a bit before checking again
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(SSE_POLL_INTERVAL)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
-# ---------------------------------------------------------------------------
-# Optional Test Endpoints (mock implementations)
-# ---------------------------------------------------------------------------
-@router.post(
-    "/api/test/mock-process",
-    response_model=ProcessImageResponse,
-    status_code=status.HTTP_200_OK,
-    summary="Mock image processing for testing",
-)
-async def mock_process_image() -> ProcessImageResponse:
-    """Return a static ``PuzzleGrid`` without performing any image processing.
-
-    Useful for frontend development and UI testing.
-
-    Returns:
-        ProcessImageResponse: Contains a mock puzzle grid.
+async def cleanup_old_sessions() -> None:
+    """Remove sessions older than SESSION_TIMEOUT to prevent memory leaks.
+    
+    Runs periodically in the background to clean up expired solving sessions.
     """
-    from .models import Constraint
-
-    # Create a simple 2x2 test grid
-    mock_cells = [
-        [
-            GridCell(row=0, col=0, value=1, isSelected=None),
-            GridCell(row=0, col=1, value=2, isSelected=None),
-        ],
-        [
-            GridCell(row=1, col=0, value=3, isSelected=None),
-            GridCell(row=1, col=1, value=4, isSelected=None),
-        ],
-    ]
-
-    mock_constraints = [
-        Constraint(type="row", index=0, sum=3, is_satisfied=False),
-        Constraint(type="row", index=1, sum=7, is_satisfied=False),
-        Constraint(type="column", index=0, sum=4, is_satisfied=False),
-        Constraint(type="column", index=1, sum=6, is_satisfied=False),
-    ]
-
-    mock_grid = PuzzleGrid(cells=mock_cells, constraints=mock_constraints)
-    return ProcessImageResponse(grid=mock_grid)
+    while True:
+        await asyncio.sleep(SESSION_CLEANUP_INTERVAL)
+        current_time = datetime.now()
+        
+        async with session_lock:
+            expired = [
+                sid for sid, data in solving_sessions.items()
+                if current_time - data["created_at"] > SESSION_TIMEOUT
+            ]
+            for sid in expired:
+                del solving_sessions[sid]
+        
+        if expired:
+            logger.info(f"Cleaned up {len(expired)} expired sessions")
 
 
-@router.post(
-    "/api/test/mock-solve",
-    response_model=SolveResponse,
-    status_code=status.HTTP_200_OK,
-    summary="Mock solving with artificial delay for UI testing",
-)
-async def mock_solve_puzzle(grid: PuzzleGrid) -> SolveResponse:
-    """Simulate solving with a delay, returning a fake solving ID.
-
-    The client can then connect to ``/api/solve-stream`` to receive dummy progress events.
-
-    Args:
-        grid: The puzzle grid (not actually solved in mock mode).
-
-    Returns:
-        SolveResponse: Contains a mock solving ID.
-    """
-    solving_id = str(uuid.uuid4())
-    return SolveResponse(solvingId=solving_id)
-
-
-# ---------------------------------------------------------------------------
-# FastAPI application instance (optional – can be imported elsewhere)
-# ---------------------------------------------------------------------------
 app = FastAPI(title="Numbers Sum Solver API", version="0.1.0")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(router)
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    """Initialize background tasks on application startup."""
+    asyncio.create_task(cleanup_old_sessions())
+    logger.info("Started session cleanup background task")

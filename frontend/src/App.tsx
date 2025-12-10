@@ -65,7 +65,7 @@ function App() {
       const response = await fetch('/api/solve', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ grid: extractedGrid }),
+        body: JSON.stringify(extractedGrid),
       });
 
       if (!response.ok) throw new Error('Failed to start solving');

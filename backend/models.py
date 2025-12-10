@@ -33,12 +33,13 @@ class Constraint(BaseModel):
         type: ``"row"`` or ``"column"`` indicating which dimension the constraint applies to.
         index: Zero‑based index of the row/column.
         sum: Target sum for the specified row/column.
+        is_satisfied: Whether the constraint is satisfied.
     """
 
     type: Literal["row", "column"] = Field(..., description="Type of constraint")
     index: int = Field(..., description="Which row/column (0‑based)")
     sum: int = Field(..., description="Target sum for that row/column")
-    is_satisfied: Optional[bool] = Field(
+    is_satisfied: bool = Field(
         default=False,
         description="Whether the constraint is satisfied (True) or not (False)",
     )
