@@ -5,6 +5,7 @@
 - Any script must have a top-level docstring explaining its purpose.
 - Use descriptive variable and function names to enhance code readability.
 - Follow PEP 8 style guidelines for Python code.
+- All imports should be at the beginning of the scripts only
 
 ## Error Handling & Logging
 
@@ -14,7 +15,7 @@
 
 ## Development Approach
 
-- Follow test-driven development: Write unit tests for all functions and methods BEFORE implementing them, to ensure code reliability. Include ALL possible edge cases.
+- Follow test-driven development: Write unit tests for all functions and methods BEFORE implementing them, to ensure code reliability. Include ALL possible edge cases. Any test script should be placed inside tests folder, not outside.
 - Ensure code is modular and reusable by breaking down large functions into smaller, focused ones.
 - Adhere to the DRY (Don't Repeat Yourself) principle to avoid code duplication.
 

@@ -5,3 +5,6 @@ pydantic
 rapidocr
 onnxruntime
 python-multipart
+scipy
+pillow
+numpy
