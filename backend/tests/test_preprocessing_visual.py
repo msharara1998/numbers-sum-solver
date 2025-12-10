@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from backend.ocr import PuzzleOCRExtractor
 
 test_image_path = Path("backend/tests/Numbers-Sum.jpg")
-output_path = Path("preprocessed_output.png")
+comparison_path = Path("backend/tests/preprocessing_comparison.png")
 
 if test_image_path.exists():
     print(f"Loading original image from: {test_image_path}")
@@ -27,9 +27,7 @@ if test_image_path.exists():
     # Convert bytes to image for saving
     img = Image.open(io.BytesIO(preprocessed_bytes))
 
-    # Also create a side-by-side comparison
-    comparison_path = Path("preprocessing_comparison.png")
-
+    # Create a side-by-side comparison
     # Resize if needed to fit side by side
     width, height = img_original.size
 

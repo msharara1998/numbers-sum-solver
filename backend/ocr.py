@@ -56,7 +56,7 @@ class PuzzleOCRExtractor:
         
         # 1. Increase contrast
         enhancer = ImageEnhance.Contrast(img)
-        img = enhancer.enhance(2.5)  # Increase contrast by 80%
+        img = enhancer.enhance(3)  # Increase contrast by 80%
         
         # 2. Increase sharpness
         enhancer = ImageEnhance.Sharpness(img)
@@ -69,9 +69,9 @@ class PuzzleOCRExtractor:
         img = img.convert('L')
         
         # 5. Apply auto-contrast
-        # img_array = np.array(img)
-        # img = Image.fromarray(img_array)
-        # img = ImageOps.autocontrast(img, cutoff=2)
+        img_array = np.array(img)
+        img = Image.fromarray(img_array)
+        img = ImageOps.autocontrast(img, cutoff=2)
         
         # Convert back to RGB for OCR engine
         img = img.convert('RGB')
